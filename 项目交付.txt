@@ -1,0 +1,1161 @@
+================================================================================
+                   ai-runtime 项目交付报告
+                   日期: 2026-05-12
+                   角色: Runtime Architect
+================================================================================
+
+
+================================================================================
+第一部分：项目概述
+================================================================================
+
+项目定位：
+  做自己的 OpenHands —— 一个更轻、更酷、更适合开源的 AI 工作站系统，
+  像 AI 操作系统一样。
+
+系统结构：
+  像素风 UI → AI Runtime 内核 → 多个 AI Agent → DeepSeek/Claude 等模型
+
+当前状态：
+  5 个阶段全部完成，共 22 个源文件，约 2500 行 Python + 576 行 HTML/CSS/JS。
+
+================================================================================
+第二部分：项目目录结构（完整文件清单）
+================================================================================
+
+ai-runtime/
+├── runtime/                         # [已实现] 内核层
+│   ├── __init__.py                  # 导出 EventBus, TaskManager
+│   ├── event_bus.py                 # 89行 Redis Streams 事件总线
+│   └── task_manager.py              # 147行 SQLite 任务管理
+│
+├── agents/                          # [已实现] 智能体层
+│   ├── __init__.py                  # 导出 Planner, CoderAgent, Issue, Reviewer
+│   ├── planner/
+│   │   ├── __init__.py
+│   │   └── planner.py              # 349行 DeepSeek 任务拆解
+│   ├── coder/
+│   │   ├── __init__.py
+│   │   └── coder.py                # 294行 代码生成 + shell + git
+│   └── reviewer/
+│       ├── __init__.py
+│       └── reviewer.py             # 662行 多维度静态审查
+│
+├── providers/                       # [已实现但有孤儿代码] 模型抽象层
+│   ├── __init__.py                  # 导出 BaseProvider, DeepSeekProvider
+│   ├── base_provider.py            # 49行 ABC 抽象基类
+│   └── deepseek_provider.py        # 60行 基于 OpenAI SDK 的 DeepSeek 实现
+│
+├── workspace/                       # [已实现] 工作空间运行时
+│   ├── __init__.py                  # 导出 WorkspaceManager
+│   └── manager.py                  # 190行 每任务独立目录 + Git
+│
+├── plugin_sdk/                      # [已实现] 插件系统
+│   ├── __init__.py                  # 导出 BasePlugin, PluginContext, PluginLoader
+│   ├── base_plugin.py              # 132行 插件基类 + 上下文
+│   ├── plugin_loader.py            # 244行 插件发现/加载/分发引擎
+│   └── examples/
+│       └── todo_checker.py         # 107行 示例插件: TODO/FIXME/HACK 检测
+│
+├── api/                             # [已实现] REST + WebSocket
+│   ├── __init__.py                  # 导出 app
+│   └── server.py                   # 282行 FastAPI 服务器
+│
+├── ui/                              # [已实现] 前端仪表盘
+│   └── pixel_mission_control.html  # 576行 像素风终端 UI
+│
+├── database/                        # [空] 仅 .gitkeep
+├── docs/spec/                       # [空] 仅 .gitkeep
+├── data/                            # [运行时产物] ai-runtime.db
+├── requirements.txt                 # 5条依赖
+│
+└── .trae/specs/                     # [内部] Trae 规格文档
+    └── create-ai-runtime-project/
+        ├── spec.md
+        ├── tasks.md
+        └── checklist.md
+
+
+================================================================================
+第三部分：模块逐一审计 & 实现状态
+================================================================================
+
+3.1 runtime/event_bus.py —— EventBus 事件总线
+----------------------------------------------------------------------
+状态: [已实现]
+
+功能:
+  - Redis Streams 消息发布 (xadd)
+  - 消费者组订阅模式 (xreadgroup + xack)
+  - 自动创建 Consumer Group (mkstream)
+  - 每条事件包含 task_id / agent / event / payload / timestamp
+
+API:
+  emit_event(task_id, agent, event, payload) -> 返回消息 ID (xadd)
+  subscribe(callback, block_ms)        -> 阻塞循环读取事件
+  stop()                               -> 停止订阅循环
+
+已知 Bug:
+  [BUG-B1] subscribe() 的 try/except 裸捕获所有 Exception (L85)，
+           StopIteration 和 KeyboardInterrupt 也被吞掉。
+           导致 PluginLoader._event_loop() 的停止机制完全失效（见交叉模块分析）。
+
+  [BUG-B2] 无重连机制。Redis 短暂断开后，订阅循环仅 sleep(1) 重试，
+          但 _running 仍为 True，永远不退出，也永远不会重新连接。
+          日志仅丢失（无 logging）。
+
+  [BUG-B3] emit_event() 中 payload=None 会被 json.dumps(None) 序列化为
+          字符串 "null"（不是 {}），消费者需要特别处理。
+
+缺失功能:
+  - 无 close() / 资源清理方法（redis_client 连接永不关闭）
+  - 无 Dead Letter Queue
+  - 纯同步实现，api/server.py 异步场景直接绕过本模块
+
+----------------------------------------------------------------------
+
+3.2 runtime/task_manager.py —— TaskManager 任务管理
+----------------------------------------------------------------------
+状态: [已实现]
+
+功能:
+  - SQLite 持久化任务
+  - CRUD: create_task() / get_task() / update_task() / list_tasks()
+  - 状态流转: pending→running→review→done/retry/failed
+
+API:
+  create_task(agent, payload, task_id?)    -> task_id
+  update_task(task_id, status?, payload?, result?) -> bool
+  get_task(task_id)                        -> dict | None
+  list_tasks(status?)                      -> list[dict]
+  close()                                  -> 关闭连接
+
+已知 Bug:
+  [BUG-B4] check_same_thread=False + SQLite，多线程并发 update_task 时
+          可能 SQLITE_BUSY 或数据损坏。应启用 WAL 模式。
+
+  [BUG-B5] get_task() / list_tasks() 返回的 payload 和 result 字段是
+          未反序列化的 JSON 字符串（不是 dict），所有消费者需各自 json.loads()。
+          极易导致 dict vs str 类型混淆 bug。
+
+  [BUG-B6] create_task() 中 payload=None 时存储为 "null"（而非 "{}"），
+          与表中 DEFAULT '{}' 不一致。
+
+缺失功能:
+  - 无批量操作 API（批量创建子任务）
+  - 无数据库连接池 / 上下文管理器
+  - 无 schema 迁移/版本化机制
+  - 缺少 created_at 索引（list_tasks 按此排序）
+
+----------------------------------------------------------------------
+
+3.3 agents/planner/planner.py —— Planner Agent
+----------------------------------------------------------------------
+状态: [已实现]
+
+功能:
+  - 调用 DeepSeek API 将用户任务拆解为 3-10 个子任务
+  - 生成子任务 DAG（依赖映射 0-based index → UUID）
+  - 子任务写入 TaskManager (agent="coder", status="pending")
+  - 通过 EventBus 广播 task.planned + subtask.created 事件
+
+API:
+  plan(task: str, task_id?: str) -> {task_id, subtasks}
+
+已知 Bug:
+  [BUG-B7] API key 缺失时构造函数直接 raise ValueError，
+          但 CoderAgent 仅 warning——策略不一致。
+
+  [BUG-B8] _strip_markdown_fence() 对前导空格不生效。
+          如果 AI 输出 "  ```json\n[...]\n  ```"（前面有缩进），
+          startswith("```json") 返回 False，清洗失败。
+
+  [BUG-B9] depends_on 只过滤 "di in id_map"，AI 返回错误的依赖索引时
+          静默丢弃，可能导致子任务执行顺序错误。
+
+缺失功能:
+  - 无规划质量验证（AI 返回 0 子任务、全部子任务循环依赖时不报错）
+  - 无子任务调度——所有子任务创建后状态 pending，没有任何调度器分发执行
+
+----------------------------------------------------------------------
+
+3.4 agents/coder/coder.py —— Coder Agent
+----------------------------------------------------------------------
+状态: [已实现]
+
+功能:
+  - 从 TaskManager 拉取任务
+  - 调用 DeepSeek API 生成代码
+  - 解析代码块 → 写入 workspace/task-<id>/ 目录
+  - 执行 shell 命令
+  - git commit
+  - 通过 EventBus 发送 6 种事件
+
+API:
+  execute(task_id: str) -> bool (True=success, False=failed)
+
+已知 Bug:
+  [BUG-B10] API key 缺失时仅 warning，但 _session.headers 已设置
+           Authorization: Bearer （空 token），后续调用 401 直接崩溃。
+
+  [BUG-B11] Shell 命令正则 RE_SHELL_CMD 使用非贪婪 .+?，
+           多行 shell 脚本只捕获第一行。$ 在 MULTILINE 模式下也提前截断。
+
+  [BUG-B12] write_file 失败时 raise 中断 execute()，
+           之前写入的文件已在 workspace 但未 git commit，也无回滚。
+
+  [BUG-B13] 使用 requests 库直调 API（204行 _call_deepseek），
+           未使用 providers/deepseek_provider.py（孤儿代码）。
+
+缺失功能:
+  - 无 stream=True 流式生成支持
+  - 无文件冲突检测（覆盖旧文件不警告）
+  - 无 rate limiting 保护
+
+----------------------------------------------------------------------
+
+3.5 agents/reviewer/reviewer.py —— Reviewer Agent
+----------------------------------------------------------------------
+状态: [已实现]
+
+功能:
+  6 类静态审查:
+    - todo:      TODO/FIXME/HACK/XXX/BUG/WORKAROUND/TEMP/KLUDGE 检测
+    - fake_impl: 桩实现（return None / pass / raise NotImplementedError）
+    - empty_func: 空函数体（仅有 docstring）
+    - missing_docstring: 缺失文档字符串
+    - syntax_error: AST 语法错误
+    - security_concern: 8 种安全模式（os.system/shell=True/eval/pickle/硬编码凭据）
+  可选 DeepSeek 深度语义审查
+  100 分制评分 + approve/reject 判定
+
+API:
+  review(task_id: str)
+    -> {approved: bool, issues: [...], score: int, task_id: str}
+
+已知 Bug:
+  [BUG-B14] ast.Str 在 Python 3.8+ 已弃用，Python 3.14 将移除。
+           应全部替换为 ast.Constant（当前最低兼容 Python 3.8 但有 DeprecationWarning）。
+
+  [BUG-B15] 安全检测中的 os.system / shell=True 模式会匹配 Reviewer 自身代码，
+           审查 workspace/manager.py 时会报告 WorkspaceManager 使用了 shell=True。
+
+  [BUG-B16] DeepSeek 深度审查使用 urllib.request（不同于 requests/openai），
+           仅 30s 超时、无重试——与 CoderAgent/Planner 的指数退避形成反差。
+
+缺失功能:
+  - 无增量审查（只审查变更文件），每次都全量扫描
+  - 无持久化审查历史表
+  - 无 max_penalty_per_category（50个 TODO 会把分扣到 0）
+
+----------------------------------------------------------------------
+
+3.6 providers/ —— Provider 抽象层
+----------------------------------------------------------------------
+状态: [已实现但为孤儿代码]
+
+文件:
+  base_provider.py    - ABC 定义 chat() 接口
+  deepseek_provider.py - 基于 OpenAI SDK 调用 DeepSeek
+
+严重问题:
+  [BUG-B17] 此模块是孤儿代码——Planner 用 requests，Coder 用 requests，
+           Reviewer 用 urllib，DeepSeekProvider 用 openai SDK，
+           没有任何 Agent 或服务使用 DeepSeekProvider。
+           存在"Provider 抽象层"的假象。
+
+  [BUG-B18] DeepSeekProvider.chat() 中 response.choices[0].message.content
+           可能为 None（tool_call 或空文本），无 null 检查。
+
+  [BUG-B19] 无重试逻辑、无超时配置——完全依赖 OpenAI SDK 默认值。
+
+缺失功能:
+  - 无 chat_async() 异步版本
+  - 无 ClaudeProvider / OpenAIProvider / OllamaProvider 实现
+
+----------------------------------------------------------------------
+
+3.7 workspace/manager.py —— WorkspaceManager
+----------------------------------------------------------------------
+状态: [已实现]
+
+功能:
+  - 每个任务独立 workspace 目录 (workspace/task-<id>/)
+  - git init / commit / status / log
+  - 文件读写（含路径安全过滤）
+  - Shell 命令执行
+  - 工作区生命周期管理 (create / exists / delete)
+
+API:
+  create(task_id)        -> Path       - git init + 目录创建
+  write_file(task_id, relpath, content) -> Path
+  read_file(task_id, relpath)          -> str
+  list_files(task_id)                  -> list[str]
+  run_shell(task_id, command, timeout) -> dict
+  git_commit(task_id, message)         -> dict
+  git_status(task_id)                  -> dict
+  git_log(task_id, max_count)          -> list[dict]
+  get_path(task_id)                    -> Path
+  exists(task_id) / delete(task_id)
+
+已知 Bug:
+  [BUG-B20] list_files() 中 ".git" not in entry.parts 过滤条件
+           不仅排除 .git/ 目录，还排除 .gitignore、.gitattributes 等文件。
+           应用改为精确排除。
+
+  [BUG-B21] create() 中 git init 失败时静默 pass（L43-L46），
+           不记录日志、不做任何处理。后续 git_commit 会失败且无提示。
+
+  [BUG-B22] read_file() 无错误处理，文件不存在时直接抛出 FileNotFoundError。
+
+缺失功能:
+  - 无 git_clone / git_diff / git_checkout
+  - 无 workspace 配额/大小限制
+  - 无并发写入保护（多 agent 同时写同一文件）
+  - 未配置 init.defaultBranch（可能产生 master vs main 警告）
+
+----------------------------------------------------------------------
+
+3.8 plugin_sdk/ —— Plugin SDK
+----------------------------------------------------------------------
+状态: [已实现]
+
+文件:
+  base_plugin.py     - BasePlugin 抽象类 + PluginContext 上下文
+  plugin_loader.py   - 插件发现/加载/事件路由/后台监听
+  examples/todo_checker.py - TODO 检测示例插件
+
+API:
+  PluginContext(event_bus, task_manager, workspace_mgr)
+  PluginLoader(ctx, plugin_dir)
+    .register(plugin) / .unregister(name)
+    .scan_plugin_dir(dir?)   - 自动发现 plugins/*.py
+    .dispatch(event_data)    - 路由事件到所有匹配插件
+    .start() / .stop()       - 启动/停止后台监听
+
+已知 Bug:
+  [BUG-B23] PluginLoader._event_loop() 创建一个全新的独立 EventBus 实例
+           (consumer_name: "plugin-group")，与主 EventBus ("ai-runtime-group")
+           和 API Server ("api-ws-group") 是三个独立消费者组。
+           架构分裂。
+
+  [BUG-B24] 停止机制完全失效——
+           PluginLoader.stop() 设置 self._running = False，
+           handle() 中 raise StopIteration()，
+           但 StopIteration 在 EventBus.subscribe() 内部的
+           "except Exception: time.sleep(1)" 处被吞掉。
+           导致后台线程永远无法退出。
+
+  [BUG-B25] start() 使用 daemon 线程，进程退出时被强制终止，
+           Redis 连接未正确关闭。
+
+  [BUG-B26] dispatch_task_created() / dispatch_task_updated()
+           两个方法是死代码——整个代码库中无调用者。
+
+  [BUG-B27] TodoCheckerPlugin 中 _total_scanned / _total_todos
+           是类级别变量，所有实例共享——多实例导致计数混乱。
+
+  [BUG-B28] PluginContext.emit() 硬编码 agent="plugin"，
+           丢失具体插件名称信息。
+
+缺失功能:
+  - 无插件间通信机制
+  - 无插件热加载/卸载
+  - 无插件间依赖声明
+
+----------------------------------------------------------------------
+
+3.9 api/server.py —— Runtime API
+----------------------------------------------------------------------
+状态: [已实现]
+
+功能:
+  WebSocket: /ws/events - 实时推送 Redis Streams 事件
+  REST API:
+    POST /tasks                    - 创建任务
+    GET  /tasks                    - 列出任务
+    GET  /tasks/{task_id}          - 查询任务
+    GET  /timeline/{task_id}       - 任务事件时间线
+    GET  /timeline                 - 全量时间线
+    GET  /health                   - 健康检查
+    GET  /                         - Pixel Mission Control UI
+
+已知 Bug:
+  [BUG-B29] API Server 绕过 EventBus 直连 Redis——
+           使用 aioredis.from_url() 直接连接，
+           创建独立消费者组 "api-ws-group"，
+           与 EventBus 的 "ai-runtime-group" 和
+           PluginLoader 的 "plugin-group" 是三套系统。
+
+  [BUG-B30] /tasks POST 端点创建任务后不触发任何 Agent 执行。
+           任务永远停留在 pending 状态——必须手动调用
+           Planner → Coder → Reviewer。
+
+  [BUG-B31] WebSocket 只推送事件，不处理客户端消息。
+           客户端无法通过 WebSocket 发送指令。
+
+  [BUG-B32] serve_ui() 使用硬编码相对路径 Path(__file__).parent.parent / "ui"，
+           部署时目录结构变化会 404。
+
+  [BUG-B33] Redis 不可用时仅 warning 降级，
+           WebSocket 连接仍然接受但不推送事件，
+           前端显示永远空白。
+
+缺失功能:
+  - 无 /tasks/{task_id}/plan   端点（触发 Planner）
+  - 无 /tasks/{task_id}/execute 端点（触发 Coder）
+  - 无 /tasks/{task_id}/review  端点（触发 Reviewer）
+  - 无 /tasks/{task_id}/workspace 端点（浏览生成文件）
+  - 无认证/鉴权
+  - 无请求速率限制
+
+----------------------------------------------------------------------
+
+3.10 ui/pixel_mission_control.html —— Pixel Mission Control UI
+----------------------------------------------------------------------
+状态: [已实现]
+
+功能:
+  - 像素风复古终端主题（VT323 + Press Start 2P 字体）
+  - CSS 扫描线叠加效果
+  - 四个面板: Task Graph / Event Timeline / Agent Status / Event Console
+  - WebSocket 实时事件连接
+  - REST API 定时任务列表轮询 (5s)
+  - 彩色事件标签 (EDIT_FILE / RUN_SHELL / CODING / PLANNING / REVIEW_FAIL)
+
+已知 Bug:
+  [BUG-B34] API 和 WS_URL 硬编码为 http://localhost:8100——
+           部署到非本地环境时完全无法使用。
+
+  [BUG-B35] parseFloat(e.timestamp)*1000——timestamp 不是有效数字时
+           结果为 NaN，new Date(NaN) 产生 Invalid Date。
+
+  [BUG-B36] updateTimeline() 每次事件都 innerHTML 重建全部 200 条 DOM，
+           高频事件下性能极差。应使用虚拟滚动或增量更新。
+
+  [BUG-B37] renderTree() 递归无深度限制——
+           恶意构造的深层嵌套任务树可导致栈溢出。
+
+  [BUG-B38] Google Fonts CDN 字体加载——无网络时回退到 Courier New，风格大变。
+
+缺失功能:
+  - 无 dark/light 主题切换
+  - 无错误提示 UI（API 请求失败静默忽略）
+  - 无响应式布局（移动设备不可用）
+  - 前端无创建任务/触发执行的能力
+
+----------------------------------------------------------------------
+
+3.11 requirements.txt
+----------------------------------------------------------------------
+状态: [已实现但有冗余]
+
+内容:
+  redis>=5.0.0
+  requests>=2.28.0
+  openai>=2.0.0      ← 孤儿依赖，仅 DeepSeekProvider 使用（且 DeepSeekProvider 是孤儿代码）
+  fastapi>=0.110.0
+  uvicorn>=0.29.0
+
+缺失:
+  - 缺少 python-dotenv（代码中多处使用 os.environ，无 .env 加载支持）
+  - 未锁定次要版本号，依赖漂移风险
+
+----------------------------------------------------------------------
+
+3.12 空目录
+----------------------------------------------------------------------
+
+  database/   - [未实现] 仅有 .gitkeep，缺少数据库迁移脚本、schema 定义
+  docs/spec/  - [未实现] 仅有 .gitkeep，缺少架构设计文档、协议规范、API 文档
+  data/       - 运行时产物（ai-runtime.db），应加入 .gitignore
+
+
+================================================================================
+第四部分：跨模块集成审计（最关键的架构问题）
+================================================================================
+
+4.1 EventBus 使用严重分裂
+----------------------------------------------------------------------
+当前三个子系统各自拥有独立的 Redis 消费者：
+
+  系统              消费者组名           连接方式        用途
+  ─────────────────────────────────────────────────────────────────
+  EventBus (同步)    ai-runtime-group      redis 同步        Agent 发送事件
+  api/server.py      api-ws-group          redis.asyncio    WebSocket 推送
+  plugin_loader.py   plugin-group          redis 同步(新实例) 插件监听
+
+这三个消费者组从同一条 Redis Streams (ai-runtime:events) 读取，
+但属于完全独立的子系统，没有任何统一的生命周期管理。
+
+影响:
+  - 三个系统各自 xack，消息消费状态不共享
+  - 某个消费者组挂掉不影响其他，但可能导致消息重复消费
+  - 无统一监控或错误恢复
+
+建议:
+  统一通过单例 EventBus (或 EventBusHub) 管理所有消费者，
+  API Server 和 PluginLoader 不应各自创建 Redis 连接。
+
+----------------------------------------------------------------------
+
+4.2 HTTP 客户端三足鼎立
+----------------------------------------------------------------------
+  模块              HTTP 方式           重试       超时
+  ─────────────────────────────────────────────────────────
+  Planner           requests.post        指数退避   60s
+  CoderAgent        requests.Session     指数退避   120s
+  Reviewer(DeepSeek) urllib.request     无          30s
+  DeepSeekProvider   openai SDK          无          SDK默认
+
+四个模块四种方式调用同一个 API。
+DeepSeekProvider 完全是孤儿代码——无任何消费者。
+
+----------------------------------------------------------------------
+
+4.3 TaskManager payload 字段约定缺失
+----------------------------------------------------------------------
+不同模块对 payload 字段名的使用：
+
+  写入方           payload 中使用的 key
+  ────────────────────────────────────────────────────
+  Planner           title, description, depends_on, parent_task_id
+  API (POST /tasks) description, raw
+  Coder (读取时)     description → task → content → str(payload)
+
+CoderAgent 靠 4 级 fallback 链容错，但缺少规范文档。
+
+----------------------------------------------------------------------
+
+4.4 致命缺失：Runtime Engine（运行时编排引擎）
+----------------------------------------------------------------------
+这是整个项目最严重的问题。
+
+当前流程：
+  用户 → API (create_task) → TaskManager (status=pending) → ????
+
+缺失的编排逻辑:
+  1. 任务创建后，没有任何东西调用 planner.plan()
+  2. 规划完成后，没有任何东西按依赖顺序调用 coder.execute(subtask_id)
+  3. 编码完成后，没有任何东西调用 reviewer.review(subtask_id)
+  4. 审查不通过时，没有任何东西触发 coder.execute() 重试
+
+每个 Agent 都是可独立调用的类，但缺少一个 Runtime Engine 把它们串联起来。
+
+缺失的状态机:
+  pending → planner.plan() → running (子任务 pending)
+  subtask.pending → coder.execute() → subtask.running → subtask.review
+  reviewer.review() → approve → done
+                    → reject  → retry → coder.execute()
+
+----------------------------------------------------------------------
+
+4.5 PluginLoader 停止机制完全失效
+----------------------------------------------------------------------
+调用链:
+  PluginLoader.stop()
+    → self._running = False
+    → _event_loop() 中 handle() 检测 _running → raise StopIteration()
+    → StopIteration 传播到 EventBus.subscribe()
+    → EventBus.subscribe() 的 except Exception 吞掉 StopIteration
+    → sleep(1) → 继续循环
+    → 后台线程永不退出
+
+同时 start() 使用 daemon 线程，进程退出时被强制终止，
+Redis 连接未关闭。
+
+
+================================================================================
+第五部分：Bug 严重性分级汇总
+================================================================================
+
+致命 (Blocker - 必须立即修复):
+───────────────────────────────────────────────────────────────────
+[F1] 缺少 Runtime Engine（Agent 编排调度器）
+     位置: 全局缺失
+     影响: 系统无法自动运行，所有 Agent 需手动逐个调用
+
+[F2] PluginLoader 停止机制完全失效（StopIteration 被吞）
+     位置: plugin_loader.py L213-L229 + event_bus.py L85
+     影响: 插件后台线程永不退出
+
+[F3] EventBus 架构分裂——三个独立消费者组
+     位置: api/server.py L72 / plugin_loader.py L213 / event_bus.py
+     影响: 无统一生命周期管理、无统一监控
+
+
+严重 (Critical - 必须尽快修复):
+───────────────────────────────────────────────────────────────────
+[C1] workspace/manager.py L88: .gitignore 等文件被 list_files() 错误排除
+[C2] event_bus.py L85: 裸 except Exception 吞掉所有错误
+[C3] task_manager.py: SQLite + check_same_thread=False 多线程数据损坏风险
+[C4] task_manager.py: get_task() 返回的 payload/result 是 JSON 字符串未反序列化
+[C5] reviewer.py L438: ast.Str 已弃用，Python 3.14 将移除
+[C6] coder.py L107: API key 缺失时 Authorization header 为空 Bearer token
+[C7] workspace/manager.py L43: git init 失败静默忽略
+[C8] ui/pixel_mission_control.html: API/WS URL 硬编码 localhost
+
+
+中等 (Major - 建议修复):
+───────────────────────────────────────────────────────────────────
+[M1] Planner vs Coder: API key 强制策略不一致 (exception vs warning)
+[M2] deepseek_provider.py: 孤儿代码，无任何消费者使用
+[M3] 三套 HTTP 客户端共存 (requests / urllib / openai SDK)
+[M4] api/server.py: /tasks POST 不触发 Agent 执行
+[M5] plugin_loader.py: dispatch_task_created/updated 死代码
+[M6] coder.py: Shell 命令解析不支持多行
+[M7] event_bus.py: subscribe() 无重连机制
+[M8] planner.py: _strip_markdown_fence 对前导空格不生效
+
+
+一般 (Minor):
+───────────────────────────────────────────────────────────────────
+[m1] event_bus.py: emit_event() payload=None 序列化为 "null"
+[m2] reviewer.py: _calculate_score 不设上限
+[m3] coder.py: 无 stream=True 流式生成
+[m4] requirements.txt: 缺少 python-dotenv
+[m5] requirements.txt: openai 依赖是孤儿
+[m6] PluginContext.emit() 硬编码 agent="plugin"
+[m7] TodoCheckerPlugin 计数器是类级别变量（多实例共享）
+
+
+================================================================================
+第六部分：修复路线图（按优先级排列）
+================================================================================
+
+P0 —— 必须立即做（系统才能跑通）
+───────────────────────────────────────────────────────────────────
+1. 创建 runtime/engine.py —— Runtime Engine 编排引擎
+   实现状态机:
+     pending → planner.plan() → 子任务 created
+     subtask.pending → coder.execute() → subtask.review
+     reviewer.review() → done / retry → coder.execute()
+   监听 EventBus 事件自动触发下一阶段
+
+2. 统一 EventBus 使用
+   移除 api/server.py 和 plugin_loader.py 中的独立 Redis 连接
+   全部通过单例 EventBus (或 EventBusHub) 管理
+   创建异步版 EventBus 用于 API Server
+
+3. 修复 PluginLoader 停止机制
+   在 EventBus.subscribe() 中单独 catch StopIteration 并退出循环
+   或在 _event_loop() 中使用 EventBus.stop()
+
+
+P1 —— 尽快做（稳定性和正确性）
+───────────────────────────────────────────────────────────────────
+4. workspace/manager.py: 修复 list_files() 过滤逻辑
+5. task_manager.py: 启用 WAL 模式，payload/result 自动序列化/反序列化
+6. reviewer.py: 替换 ast.Str → ast.Constant
+7. coder.py: 修复 API key 缺失时的 Bearer header 问题
+8. agent 层统一使用 DeepSeekProvider（消除三套 HTTP 客户端）
+
+
+P2 —— 功能完善
+───────────────────────────────────────────────────────────────────
+9. api/server.py: 添加 /tasks/{id}/plan | /execute | /review 端点
+10. ui: API URL 改为可配置的（通过 /api/config 端点或 URL 参数）
+11. 添加 python-dotenv 支持 .env 文件
+12. 清理孤儿代码或正式接入 DeepSeekProvider
+
+
+P3 —— 增强（生产化）
+───────────────────────────────────────────────────────────────────
+13. 添加认证/鉴权（API Key / JWT）
+14. 添加请求速率限制
+15. UI 响应式布局 + 离线字体
+16. 数据库迁移框架 (Alembic)
+17. 补齐 ClaudeProvider / OpenAIProvider / OllamaProvider
+
+
+================================================================================
+第七部分：架构全景图
+================================================================================
+
+当前架构（5层）:
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        UI Layer                                 │
+│  pixel_mission_control.html  (WebSocket + REST)                 │
+└────────────────────────┬────────────────────────────────────────┘
+                         │ ws:// /events
+                         │ GET /tasks, /timeline
+┌────────────────────────▼────────────────────────────────────────┐
+│                       API Layer                                 │
+│  api/server.py  (FastAPI + WebSocket + 同步REST)               │
+└────────────────────────┬────────────────────────────────────────┘
+                         │ (未连接——缺少 Engine)
+┌────────────────────────▼────────────────────────────────────────┐
+│                    Agent Layer                                  │
+│  Planner ──→ CoderAgent ──→ Reviewer                           │
+│  (手动调用)   (手动调用)     (手动调用)                           │
+└──────┬──────────────┬────────────────┬──────────────────────────┘
+       │              │                │
+       ▼              ▼                ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Runtime Layer                                │
+│  EventBus (Redis Streams)  ←→  TaskManager (SQLite)            │
+│  WorkspaceManager (FS+Git)  ←  PluginLoader                     │
+└──────┬──────────────────────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Provider Layer                               │
+│  BaseProvider → DeepSeekProvider (孤儿代码)                     │
+│  实际: requests / urllib / openai SDK 三套并存                  │
+└─────────────────────────────────────────────────────────────────┘
+
+
+期望架构（添加 Runtime Engine 后）:
+
+┌─────────────────────────────────────────────────────────────────┐
+│  UI (Pixel Mission Control)                                     │
+└────────────────────────┬────────────────────────────────────────┘
+                         │ WebSocket + REST
+┌────────────────────────▼────────────────────────────────────────┐
+│  api/server.py  (FastAPI)                                       │
+│  /plan → /execute → /review 端点                                │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────────────┐
+│  ⭐ runtime/engine.py  (Runtime Engine) ⭐                      │
+│  状态机: pending → plan → code → review → done/retry            │
+│  监听 EventBus 事件，自动驱动下一阶段                             │
+│  PluginLoader 集成                                              │
+└──────┬──────────────┬────────────────┬──────────────────────────┘
+       │              │                │
+       ▼              ▼                ▼
+   Planner        CoderAgent       Reviewer
+       │              │                │
+       └──────────────┴────────┬───────┘
+                               │
+                      ┌────────▼────────┐
+                      │   EventBus      │
+                      │   TaskManager   │
+                      │   WorkspaceMgr  │
+                      │   PluginSDK     │
+                      └─────────────────┘
+
+
+================================================================================
+第八部分：已验证通过的功能清单
+================================================================================
+
+✅ EventBus: emit_event / subscribe / Consumer Group 自动创建
+✅ TaskManager: create_task / get_task / update_task / list_tasks
+✅ WorkspaceManager: create / write_file / read_file / list_files / run_shell
+✅ WorkspaceManager: git_commit / git_status / git_log
+✅ WorkspaceManager: 路径安全过滤（防目录穿越）
+✅ WorkspaceManager: 每任务独立目录隔离
+✅ Planner: DeepSeek API 调用 / 子任务生成 / DAG 依赖映射
+✅ CoderAgent: DeepSeek API 调用 / 代码块解析 / 文件写入 / Shell 执行
+✅ CoderAgent: git commit 编码结果
+✅ Reviewer: 6 类静态审查 (TODO / fake_impl / empty_func / docstring / syntax / security)
+✅ Reviewer: 100 分制评分 / approve-reject 判定
+✅ Reviewer: 任务级 workspace 扫描
+✅ PluginSDK: BasePlugin 抽象 / PluginContext 上下文 / PluginLoader 注册/分发
+✅ PluginSDK: 文件扫描自动加载插件
+✅ TodoChecker 示例插件: TODO/FIXME/HACK 检测 / 事件发送
+✅ PluginLoader: 事件过滤 (subscribe 白名单)
+✅ PluginLoader: unregister 卸载
+✅ api/server.py: 7 个端点全部可达 (REST + WebSocket + UI)
+✅ api/server.py: CORS 全开 / Redis 不可用时优雅降级启动
+✅ ui: WebSocket 实时事件接收 / REST 任务列表 5s 轮询
+✅ ui: 4 面板布局 / Agent 实时状态 (IDLE/ACTIVE/STUCK) / 彩色标签
+✅ ui: 任务树形依赖图 / 事件时间线
+✅ DeepSeekProvider: 基于 OpenAI SDK 的正常调用路径 (语法/导入验证通过)
+
+
+================================================================================
+第九部分：未实现功能清单（TODO 列表）
+================================================================================
+
+以下功能在需求中提及或架构设计需要，但当前未实现：
+
+9.1 运行时层（最紧急）
+───────────────────────────────────────────────────────────────────
+☐ runtime/engine.py —— Runtime Engine 编排引擎
+   需要实现的状态机:
+     pending → planner.plan() → 子任务 pending
+     子任务 pending → coder.execute() → review
+     reviewer.review() → done (通过) / retry (不通过→coder.execute())
+
+☐ EventBus 异步版本 —— 供 api/server.py 使用
+   当前 api/server.py 因为 EventBus 是同步的，直接绕过了它
+
+☐ EventBus 单例管理 / EventBusHub
+   统一管理所有 Redis 消费者组生命周期
+
+☐ EventBus 重连机制
+   Redis 断开后自动重连 + 指数退避
+
+9.2 API 层
+───────────────────────────────────────────────────────────────────
+☐ /tasks/{task_id}/plan      端点 —— 触发 Planner
+☐ /tasks/{task_id}/execute   端点 —— 触发 CoderAgent
+☐ /tasks/{task_id}/review    端点 —— 触发 Reviewer
+☐ /tasks/{task_id}/workspace 端点 —— 浏览生成的文件
+☐ API 认证/鉴权机制 (JWT / API Key)
+☐ 请求速率限制 (rate limiting)
+☐ POST /tasks 创建任务后自动触发 Planner
+
+9.3 Agent 层
+───────────────────────────────────────────────────────────────────
+☐ Planner/Coder/Reviewer 统一接入 DeepSeekProvider（消除三套 HTTP 客户端）
+☐ CoderAgent stream=True 流式代码生成
+☐ CoderAgent 文件冲突检测（覆盖旧文件前提示）
+☐ Planner 规划质量验证（循环依赖检测、空规划检测）
+☐ Reviewer 增量审查（只审查 Git diff 变更文件）
+☐ Reviewer 审查历史持久化表
+☐ Agent 间通信协议标准化（payload 字段名规范文档）
+
+9.4 Provider 层
+───────────────────────────────────────────────────────────────────
+☐ ClaudeProvider (Anthropic API)
+☐ OpenAIProvider (OpenAI API)
+☐ OllamaProvider (本地模型)
+☐ DeepSeekProvider.chat_async() 异步版本
+☐ Provider 超时/重试统一配置
+
+9.5 Workspace 层
+───────────────────────────────────────────────────────────────────
+☐ git_diff() / git_checkout() / git_clone() 方法
+☐ 工作区磁盘配额限制
+☐ 并发写入保护（写锁）
+☐ .gitignore / .gitattributes 不被 list_files() 排除
+
+9.6 Plugin SDK 层
+───────────────────────────────────────────────────────────────────
+☐ 插件热加载/卸载（运行时动态增删）
+☐ 插件间通信机制
+☐ 插件间依赖声明
+☐ dispatch_task_created/updated 死代码复活或清理
+
+9.7 UI 层
+───────────────────────────────────────────────────────────────────
+☐ API URL 可配置（URL 参数 / 环境变量 / /api/config 端点）
+☐ 响应式布局（移动端适配）
+☐ 离线字体 fallback（base64 内嵌或本地文件）
+☐ 错误提示 UI（非静默 catch）
+☐ 前端可触发任务创建和执行
+☐ 主题切换 (dark/light)
+☐ 虚拟滚动（高频事件性能优化）
+
+9.8 基础设施
+───────────────────────────────────────────────────────────────────
+☐ python-dotenv 支持 .env 文件加载
+☐ database/ 数据库迁移脚本 (Alembic)
+☐ database/ schema 定义 SQL
+☐ docs/spec/ 架构设计文档
+☐ docs/spec/ Event 字典定义文档
+☐ docs/spec/ Agent 通信协议规范
+☐ .gitignore 文件（排除 data/、__pycache__/、*.pyc）
+☐ CI/CD 流程 (linting / testing)
+☐ 单元测试 / 集成测试套件
+
+
+================================================================================
+第十部分：项目统计数据
+================================================================================
+
+10.1 文件统计
+───────────────────────────────────────────────────────────────────
+  Python 文件:    21 个
+  HTML 文件:      1 个
+  配置文件:       1 个 (requirements.txt)
+  空目录:         2 个 (database/, docs/spec/)
+  ─────────────────────
+  总源文件:       23 个
+
+10.2 代码量统计
+───────────────────────────────────────────────────────────────────
+  模块                 文件数    总行数
+  ─────────────────────────────────────
+  runtime/              2        236
+  agents/               5       1358
+  providers/            3        112
+  workspace/            2        194
+  plugin_sdk/           4        487
+  api/                  2        286
+  ui/                   1        576
+  ─────────────────────────────────────
+  总计                  19      3249
+
+  Python 纯代码:    ~2500 行
+  HTML/CSS/JS:      ~576 行
+  文档/注释:         ~193 行 (已计入总行数)
+  空行:              ~200 行
+
+10.3 Bug 统计
+───────────────────────────────────────────────────────────────────
+  致命 (Blocker):    3 个
+  严重 (Critical):   8 个
+  中等 (Major):      8 个
+  一般 (Minor):      7 个
+  ─────────────────────
+  总计:             26 个已知 Bug
+
+10.4 技术栈
+───────────────────────────────────────────────────────────────────
+  语言:              Python 3.11
+  消息队列:          Redis Streams (redis-py >=5.0.0)
+  数据库:            SQLite 3
+  API 框架:          FastAPI 0.136.1
+  ASGI Server:       Uvicorn 0.46.0
+  LLM SDK:           OpenAI SDK 2.36.0 (孤儿依赖)
+  前端:              纯 HTML/CSS/JS (无框架)
+  字体:              Google Fonts (Press Start 2P + VT323)
+  版本控制:          Git (WorkspaceManager 内部)
+  依赖管理:          pip + requirements.txt
+
+
+================================================================================
+第十一部分：模块间接口契约（API 签名汇总）
+================================================================================
+
+11.1 EventBus
+───────────────────────────────────────────────────────────────────
+  emit_event(task_id: str, agent: str, event: str, payload: Any) -> str
+  subscribe(callback: Callable[[Dict[str,str]], None], block_ms: int) -> None
+  stop() -> None
+
+11.2 TaskManager
+───────────────────────────────────────────────────────────────────
+  create_task(agent: str, payload: Any, task_id?: str) -> str
+  update_task(task_id: str, status?: str, payload?: Any, result?: Any) -> bool
+  get_task(task_id: str) -> Optional[Dict[str, Any]]
+  list_tasks(status?: str) -> List[Dict[str, Any]]
+  close() -> None
+
+11.3 BaseProvider
+───────────────────────────────────────────────────────────────────
+  chat(messages: List[Dict[str,str]], temperature: float, max_tokens: int,
+       **kwargs) -> str
+
+11.4 WorkspaceManager
+───────────────────────────────────────────────────────────────────
+  create(task_id: str) -> Path
+  write_file(task_id: str, relpath: str, content: str) -> Path
+  read_file(task_id: str, relpath: str) -> str
+  list_files(task_id: str) -> List[str]
+  run_shell(task_id: str, command: str, timeout: int) -> Dict[str, Any]
+  git_commit(task_id: str, message: str) -> Dict[str, Any]
+  git_status(task_id: str) -> Dict[str, Any]
+  git_log(task_id: str, max_count: int) -> List[Dict[str, str]]
+  get_path(task_id: str) -> Path
+  exists(task_id: str) -> bool
+  delete(task_id: str) -> bool
+
+11.5 Planner
+───────────────────────────────────────────────────────────────────
+  plan(task: str, task_id?: str) -> Dict[str, Any]
+      返回: {"task_id": str, "subtasks": [{"id","title","description","depends_on"}]}
+
+11.6 CoderAgent
+───────────────────────────────────────────────────────────────────
+  execute(task_id: str) -> bool
+
+11.7 Reviewer
+───────────────────────────────────────────────────────────────────
+  review(task_id: str) -> Dict[str, Any]
+      返回: {"approved": bool, "issues": [Issue], "score": int, "task_id": str}
+
+11.8 PluginLoader
+───────────────────────────────────────────────────────────────────
+  register(plugin: BasePlugin) -> None
+  unregister(name: str) -> bool
+  scan_plugin_dir(dir?: str) -> int
+  dispatch(data: Dict[str, str]) -> None
+  start() -> None
+  stop() -> None
+  list_plugins() -> List[Dict[str, str]]
+  has_plugin(name: str) -> bool
+
+11.9 BasePlugin (供插件开发者继承)
+───────────────────────────────────────────────────────────────────
+  name: str           # 插件名称 (必填)
+  version: str        # 版本号
+  description: str    # 描述
+  on_load()           # 加载时回调
+  on_unload()         # 卸载时回调
+  on_event(task_id, agent, event, payload)  # 事件回调 (抽象方法，必须实现)
+  subscribe() -> List[str]  # 事件白名单过滤
+  on_task_created(task: dict)  # 任务创建回调
+  on_task_updated(task: dict, old_status: str)  # 状态变更回调
+
+
+================================================================================
+第十二部分：事件流字典 (Event Dictionary)
+================================================================================
+
+以下是当前系统中所有可能发出的事件：
+
+12.1 Planner 事件
+───────────────────────────────────────────────────────────────────
+  task.planned         Planner → 规划完成
+    payload: {task_id, goal, subtasks, subtask_count}
+  subtask.created      Planner → 子任务已创建 (每个子任务一条)
+    payload: {parent_task_id, subtask_id, title, description, depends_on}
+
+12.2 CoderAgent 事件
+───────────────────────────────────────────────────────────────────
+  task.coding_started   Coder → 开始编码
+    payload: {agent, workspace}
+  task.code_generated   Coder → DeepSeek 返回代码
+    payload: {model, response_length}
+  task.code_written     Coder → 文件已写入 (每个文件一条)
+    payload: {file}
+  task.git_committed    Coder → git commit 完成
+    payload: {commit, files}
+  task.shell_executed   Coder → shell 命令执行 (每条命令一条)
+    payload: {command, exit_code, output_preview}
+  task.coding_completed Coder → 编码完成
+    payload: {files_count, shell_count}
+  task.coding_failed    Coder → 编码失败
+    payload: {error}
+
+12.3 Reviewer 事件
+───────────────────────────────────────────────────────────────────
+  task.review_started   Reviewer → 开始审查
+    payload: {workspace}
+  task.review_approved  Reviewer → 审查通过
+    payload: {score, issues_count}
+  task.review_rejected  Reviewer → 审查不通过
+    payload: {score, issues}
+
+12.4 API / 用户操作事件
+───────────────────────────────────────────────────────────────────
+  task.created          API → 用户创建任务
+    payload: {description / raw}
+
+12.5 插件事件 (由插件自行发送)
+───────────────────────────────────────────────────────────────────
+  plugin.todo_found          TodoChecker → 发现 TODO 标记
+    payload: {plugin, file, count, items: [{line, tag, text}]}
+  plugin.todo_check_complete TodoChecker → 检查完成
+    payload: {plugin, files_scanned, todos_found}
+
+
+================================================================================
+第十三部分：给 Runtime Architect 的明确行动建议
+================================================================================
+
+13.1 立即行动 (本周) —— 让系统能跑通
+───────────────────────────────────────────────────────────────────
+  A1. 实现 runtime/engine.py
+      创建 RuntimeEngine 类，实现状态机:
+        - 监听 EventBus 事件
+        - task.created → 自动调用 Planner.plan()
+        - subtask.created → 按依赖顺序调用 CoderAgent.execute()
+        - task.coding_completed → 自动调用 Reviewer.review()
+        - task.review_rejected → 自动调用 CoderAgent.execute() 重试
+      这是整个系统"活起来"的关键。
+
+  A2. 在 api/server.py 的 create_task 端点中接入 Engine
+      不再让任务停留在 pending 状态。
+
+13.2 短期行动 (本月)
+───────────────────────────────────────────────────────────────────
+  B1. 统一 HTTP 客户端 → 全部 Agent 接入 DeepSeekProvider
+  B2. 修复致命 Bug: PluginLoader 停止机制、EventBus 架构分裂
+  B3. 修复严重 Bug: workspace/manager.py 文件过滤、ast.Str 弃用、
+     TaskManager payload 序列化/反序列化
+  B4. 给 api/server.py 添加 /tasks/{id}/plan|execute|review 端点
+  B5. 给 ui/pixel_mission_control.html 的 API URL 做成可配置的
+
+13.3 中期行动 (下个里程碑)
+───────────────────────────────────────────────────────────────────
+  C1. 添加 python-dotenv
+  C2. 添加 .gitignore
+  C3. 补齐 ClaudeProvider / OpenAIProvider / OllamaProvider
+  C4. 完善 database/ (迁移脚本 + schema)
+  C5. 完善 docs/spec/ (架构文档 + Event 规范 + 通信协议)
+
+13.4 长期增强
+───────────────────────────────────────────────────────────────────
+  D1. 认证/鉴权
+  D2. 请求速率限制
+  D3. 单元测试 + 集成测试
+  D4. CI/CD 流程
+  D5. UI 响应式 + 离线优化
+
+
+================================================================================
+第十四部分：开发者快速上手指南
+================================================================================
+
+14.1 环境准备
+───────────────────────────────────────────────────────────────────
+  # 安装依赖
+  cd ai-runtime
+  pip install -r requirements.txt
+
+  # 启动 Redis (Docker 或本地)
+  docker run -d -p 6379:6379 redis:7
+
+  # 配置环境变量
+  set DEEPSEEK_API_KEY=sk-xxxxxxxx
+
+14.2 启动系统
+───────────────────────────────────────────────────────────────────
+  # 启动 API 服务器 (含 UI)
+  uvicorn api.server:app --host 0.0.0.0 --port 8100 --reload
+
+  # 打开浏览器
+  http://localhost:8100
+
+14.3 手动驱动 Agent (当前模式，Engine 到位后自动化)
+───────────────────────────────────────────────────────────────────
+  from runtime.event_bus import EventBus
+  from runtime.task_manager import TaskManager
+  from workspace.manager import WorkspaceManager
+  from agents.planner import Planner
+  from agents.coder import CoderAgent
+  from agents.reviewer import Reviewer
+
+  bus = EventBus()
+  tm = TaskManager()
+  wm = WorkspaceManager()
+
+  # Step 1: Plan
+  planner = Planner(bus, tm, api_key="sk-xxx")
+  result = planner.plan("写一个 Python 贪吃蛇游戏")
+  root_id = result["task_id"]
+
+  # Step 2: Code (每个子任务)
+  coder = CoderAgent(tm, bus, wm, api_key="sk-xxx")
+  for subtask in result["subtasks"]:
+      coder.execute(subtask["id"])
+
+  # Step 3: Review
+  reviewer = Reviewer(bus, tm, wm)
+  for subtask in result["subtasks"]:
+      review_result = reviewer.review(subtask["id"])
+      print(f"{subtask['id']}: {'PASS' if review_result['approved'] else 'FAIL'}")
+
+14.4 编写自定义插件
+───────────────────────────────────────────────────────────────────
+  from plugin_sdk.base_plugin import BasePlugin
+
+  class MyPlugin(BasePlugin):
+      name = "my-plugin"
+      version = "1.0"
+      description = "我的自定义插件"
+
+      def subscribe(self):
+          return ["task.review_rejected"]
+
+      def on_event(self, task_id, agent, event, payload):
+          # 你的逻辑
+          self.ctx.emit(task_id, "plugin.my_event", {"hello": "world"})
+
+  # 注册到 PluginLoader:
+  from plugin_sdk import PluginLoader, PluginContext
+  loader = PluginLoader(ctx)
+  loader.register(MyPlugin())
+
+
+================================================================================
+                            报告结束
+                    ai-runtime 项目交付 — v1.0
+================================================================================
